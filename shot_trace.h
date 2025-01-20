@@ -15,6 +15,7 @@
 #include <fstream>
 #include <chrono>
 #include "shot_trace_utils.h"
+#include <numeric>
 
 
 namespace st
@@ -46,15 +47,7 @@ namespace st
 
     // AI Model
     Net HEADER_MODEL;
-    // Image processing
-    float SCALE_FACTOR = 0.0;
-    Ptr<BackgroundSubtractor> KNN_BACKSUB = createBackgroundSubtractorKNN(3, 500, true);
-
-    // Global parameters
-    int FRAME_WIDTH = 0;
-    int FRAME_HEIGHT = 0;
-    int LENGTH = 0;
-
+    
     // Other
     int FMT = VideoWriter::fourcc('m', 'p', '4', 'v');
     const float  PI_F = 3.14159265f;
@@ -93,10 +86,18 @@ namespace st
     void loading_model(string model_path)
     {
         HEADER_MODEL = readNetFromONNX(model_path);
+        if (HEADER_MODEL.empty())
+        {
+            std::cerr << "Failed to load the network. Check the model path or format." << std::endl;
+        }
+        else
+            cout << "Successfully loaded the model!" << endl;
     }
 
 
-    cv::Mat preprocessing_frame(cv::Mat original_frame, bool mix_mask)
+    cv::Mat preprocessing_frame(Ptr<BackgroundSubtractor> KNN_BACKSUB,
+        int LENGTH, int FRAME_WIDTH, int FRAME_HEIGHT,
+        cv::Mat original_frame, bool mix_mask)
     {
         cv::Mat gray_image;
         cv::cvtColor(original_frame, gray_image, cv::COLOR_BGR2GRAY);
@@ -144,11 +145,24 @@ namespace st
         cv::Rect& best_club_box, cv::Rect& best_header_box,
         float& best_club_score, float& best_header_score,
         std::vector<float>& club_center_point,
-        std::vector<float>& header_center_point)
+        std::vector<float>& header_center_point, 
+        float SCALE_FACTOR)
     {
         cv::Mat blob;
-        blobFromImage(preprocessed_frame, blob, 1. / 255., cv::Size(INPUT_WIDTH, INPUT_HEIGHT),
+        blobFromImage(preprocessed_frame, blob, 1. / 255., cv::Size(INPUT_WIDTH, INPUT_HEIGHT), //1. / 255. INPUT_WIDTH, INPUT_HEIGHT
             cv::Scalar(), true, false);
+        
+        ///Debug
+        cout << "check preprocessed_frame: " << preprocessed_frame.size() << endl;
+        double minVal, maxVal;
+        cv::Point minLoc, maxLoc;
+        cv::minMaxLoc(preprocessed_frame, &minVal, &maxVal);
+        std::cout << "preprocessed_frame Min value: " << minVal << endl;
+        std::cout << "preprocessed_frame Max value: " << maxVal << endl;
+
+        std::cout << "blob.dims: " << blob.dims << std::endl;
+        std::cout << "blob.size: " << blob.size << std::endl;
+
         HEADER_MODEL.setInput(blob);
         std::vector<cv::Mat> outputs;
         HEADER_MODEL.forward(outputs, HEADER_MODEL.getUnconnectedOutLayersNames());
@@ -158,6 +172,7 @@ namespace st
         outputs[0] = outputs[0].reshape(1, dimensions);
         cv::transpose(outputs[0], outputs[0]); //[84 x 8400]
         auto data = (float*)outputs[0].data;
+        //std::cout << "check data info: " << rows << ", " << dimensions << endl;
 
         for (int i = 0; i < rows; ++i)
         {
@@ -203,6 +218,8 @@ namespace st
     void detecting_rawPhases(bool& bool_AD, bool& bool_TP, bool& bool_IM, bool& bool_FN,
         std::vector<float> club_center_point, std::vector<float> header_center_point)
     {
+        if (header_center_point[0] == 0)
+            return;
         if (!bool_AD && header_center_point[0] > club_center_point[0] && header_center_point[1] > club_center_point[1])
         {
             cout << "Raw Address detected" << endl;
@@ -292,11 +309,19 @@ namespace st
             utils::fs::remove_all(saved_output_frame);
             utils::fs::createDirectory(saved_output_frame);
         }
+
+        VideoCapture try_cap(video_path);
+        Mat try_frame;
+        try_cap.read(try_frame);
+        try_cap.release();
+        int FRAME_WIDTH = try_frame.cols;
+        int FRAME_HEIGHT = try_frame.rows;
+        cout << "check FRAME_WIDTH: " << FRAME_WIDTH << endl;
+        cout << "check FRAME_HEIGHT: " << FRAME_HEIGHT << endl;
         VideoCapture cap(video_path);
-        FRAME_WIDTH = cap.get(CAP_PROP_FRAME_WIDTH);
-        FRAME_HEIGHT = cap.get(CAP_PROP_FRAME_HEIGHT);
-        LENGTH = std::max(FRAME_WIDTH, FRAME_HEIGHT);
-        SCALE_FACTOR = LENGTH / DIM;
+
+        int LENGTH = std::max(FRAME_WIDTH, FRAME_HEIGHT);
+        float SCALE_FACTOR = LENGTH / DIM;
         VideoWriter writer;
         if (show_stack_input)
             writer = VideoWriter(saved_output_video_path, FMT, write_fps, Size(LENGTH, LENGTH));
@@ -313,10 +338,13 @@ namespace st
         bool detectFailed = false;
         std::vector<float> previous_header_center_point;
         AD_wrist_position = std::vector<float>{ 0., 0. };
+
+        Ptr<BackgroundSubtractor> KNN_BACKSUB = createBackgroundSubtractorKNN(3, 500, true);
+
         while (cap.read(frame))
         {
             cv::Mat preprocessed_frame;
-            preprocessed_frame = preprocessing_frame(frame, true);
+            preprocessed_frame = preprocessing_frame(KNN_BACKSUB, LENGTH, FRAME_WIDTH, FRAME_HEIGHT, frame, true);
             //cout << "check here" << endl;
             cv::Rect best_club_box(0, 0, 0, 0), best_header_box(0, 0, 0, 0);
             float best_club_score = 0.;
@@ -325,25 +353,31 @@ namespace st
             detecting_header_byframe(preprocessed_frame,
                 best_club_box, best_header_box,
                 best_club_score, best_header_score,
-                club_center_point, header_center_point);
+                club_center_point, header_center_point, SCALE_FACTOR);
+            std::cout << frame_num << " :header_center_point: " << header_center_point[0] << endl;
             float rate = intersection_rate(best_club_box, best_header_box);
-            detecting_rawPhases(bool_AD, bool_TP, bool_IM, bool_FN,
-                club_center_point, header_center_point);
-            if (bool_AD && AD_wrist_position[0] == 0)
-                AD_wrist_position = std::vector<float>{ (float)best_club_box.x, (float)best_club_box.y };
             if (rate < MIN_INTER_RATE)
                 std::cout << frame_num << " :No detection" << endl;
             else
             {
                 header_size = std::vector<int>{ best_header_box.width, best_header_box.height };
                 locating_current_region(current_region, club_center_point, header_center_point);
+                std::cout << "current_region: " << current_region << endl;
             }
-            //std::cout << frame_num << " :current_region: " << current_region << endl;
             if (rate == 0 || best_header_score == 0)
             {
                 detectFailed = true;
+                std::cout << frame_num << " :redetecting header: " << endl;
                 redetecting_header(header_center_point, best_club_box, best_header_box, current_region, header_size);
             }
+
+            detecting_rawPhases(bool_AD, bool_TP, bool_IM, bool_FN,
+                club_center_point, header_center_point);
+            if (bool_FN)
+                break;
+            if (bool_AD && AD_wrist_position[0] == 0)
+                AD_wrist_position = std::vector<float>{ (float)best_club_box.x, (float)best_club_box.y };
+            
             if (header_center_point[0] != 0)
             {
                 previous_header_center_point = header_center_point;
@@ -351,8 +385,6 @@ namespace st
             else
                 header_center_point = previous_header_center_point;
             list_header_center_points.push_back(header_center_point);
-            if (bool_FN)
-                break;
             cv::Mat draw_frame;
             if (show_stack_input)
                 draw_frame = preprocessed_frame.clone();
@@ -395,7 +427,7 @@ namespace st
             )
         );
         std::vector<float> IM_stage = st::np_slice(list_header_center_points, raw_top, list_header_center_points.size() - 1, 1);
-        std::vector<std::vector<double>> list{ {1, 20},  {2, 30}, {3, 40}, {4, 50} };
+        //std::vector<std::vector<double>> list{ {1, 20},  {2, 30}, {3, 40}, {4, 50} };
         //std::vector<double> test = np_slice(list, 1, 2, 1);
         //cout << "check gggggggggggggggggfffffffffffffffffffffffffffffffffffffffffffffffff: " << test[0] << endl;
         IM_frame = st::np_argmax(IM_stage);
@@ -422,7 +454,8 @@ namespace st
             AD_frame = AD_stage.size() - indices[0] - 2;
         else
             AD_frame = AD.back();
-        trimmed_header_center_points = st::np_slice(list_header_center_points, AD_frame, IM_frame + 1);
+        //trimmed_header_center_points = st::np_slice(list_header_center_points, AD_frame, IM_frame + 1);
+        //throw std::out_of_range("Out of range error!");
     }
 
 
@@ -430,7 +463,10 @@ namespace st
         std::vector<float>& the_first_golfball_point,
         int delay, float resize_factor)
     {
-        cv::VideoCapture cap(video_path);
+        cv::VideoCapture cap(video_path, cv::CAP_FFMPEG);
+        //check backend
+        int backend = static_cast<int>(cap.get(cv::CAP_PROP_BACKEND));
+        std::cout << "Backend ID: " << backend << std::endl;
         if (!cap.isOpened())
         {
             std::cerr << "Error opening video file" << std::endl;
@@ -477,6 +513,7 @@ namespace st
         //cv::imshow(window_name, frame);
         //cv::waitKey(0);
         cv::destroyAllWindows();
+        cout << "init box: " << init_bbox << endl;
     }
 
 
@@ -504,12 +541,13 @@ namespace st
         loading_model(model_path);
         cv::Mat original_frame = cv::imread(frame_path);
         cv::Mat preprocessed_frame;
-        FRAME_WIDTH = original_frame.cols;
-        FRAME_HEIGHT = original_frame.rows;
-        LENGTH = std::max(FRAME_WIDTH, FRAME_HEIGHT);
-        SCALE_FACTOR = LENGTH / DIM;
+        int FRAME_WIDTH = original_frame.cols;
+        int FRAME_HEIGHT = original_frame.rows;
+        int LENGTH = std::max(FRAME_WIDTH, FRAME_HEIGHT);
+        float SCALE_FACTOR = LENGTH / DIM;
         cout << LENGTH << ", " << SCALE_FACTOR << endl;
-        preprocessed_frame = preprocessing_frame(original_frame, true);
+        Ptr<BackgroundSubtractor> KNN_BACKSUB = createBackgroundSubtractorKNN(3, 500, true);
+        preprocessed_frame = preprocessing_frame(KNN_BACKSUB, LENGTH, FRAME_WIDTH, FRAME_HEIGHT, original_frame, true);
         cout << preprocessed_frame.size() << endl;
         cv::Rect best_club_box(0, 0, 0, 0), best_header_box(0, 0, 0, 0);
         float best_club_score = 0.;
@@ -519,7 +557,7 @@ namespace st
         detecting_header_byframe(preprocessed_frame,
             best_club_box, best_header_box,
             best_club_score, best_header_score,
-            club_center_point, header_center_point);
+            club_center_point, header_center_point, SCALE_FACTOR);
         cv::Mat draw_frame = original_frame.clone();
         draw_bounding_box(draw_frame, best_club_box, best_header_box,
             header_center_point, best_club_score, best_header_score, true);
@@ -587,6 +625,7 @@ namespace st
         int IM_frame, bool save_output)
     {
         Ptr<BackgroundSubtractor> backSub = createBackgroundSubtractorKNN(3, 500, true);
+        //Ptr<BackgroundSubtractor> backSub = createBackgroundSubtractorMOG2(20, 100, true);
         Ptr<SimpleBlobDetector> golfball_detector = create_ball_detector(0.2, 0.2, 0.1);
         string check_output_folder = "./check_outputs_1";
         string check_mask_folder = "./check_masks_1";
@@ -690,7 +729,9 @@ namespace st
         std_angle = std_angle * (180.0 / PI_F);
         cout << "check std_angle: " << std_angle << endl;
         float max_dis = std::sqrt(vect[0] * vect[0] + vect[1] * vect[1]);
-        Ptr<BackgroundSubtractor> backSub = createBackgroundSubtractorKNN(3, 300, true);
+        Ptr<BackgroundSubtractor> backSub = createBackgroundSubtractorKNN(3, 500, true);
+        //Ptr<BackgroundSubtractor> backSub = createBackgroundSubtractorMOG2(20, 100, true);
+        //Ptr<BackgroundSubtractor> backSub = createBackgroundSubtractorMOG2();
         Ptr<SimpleBlobDetector> golfball_detector = create_ball_detector(0.1, 0.1, 0.01);
         string check_output_folder = "./check_outputs_2";
         string check_mask_folder = "./check_masks_2";
@@ -841,11 +882,8 @@ namespace st
         int IM_frame, int write_fps, int interval)
     {
         VideoCapture cap(video_path);
-        if (FRAME_WIDTH == 0)
-        {
-            FRAME_WIDTH = cap.get(CAP_PROP_FRAME_WIDTH);
-            FRAME_HEIGHT = cap.get(CAP_PROP_FRAME_HEIGHT);
-        }
+        int FRAME_WIDTH = cap.get(CAP_PROP_FRAME_WIDTH);
+        int FRAME_HEIGHT = cap.get(CAP_PROP_FRAME_HEIGHT);
         VideoWriter writer(video_output_path, FMT, write_fps, Size(FRAME_WIDTH, FRAME_HEIGHT));
         std::vector<std::vector<float>> cut_header_center_points(list_header_center_points.begin(),
             list_header_center_points.begin() + IM_frame);
@@ -949,19 +987,36 @@ namespace st
         int write_fps, bool debug_header, bool debug_ball)
     {
         // Detect header
-        bool show_stack_input = false;
-        bool showClub = false;
+        bool show_stack_input = true;
+        bool showClub = true;
         std::vector<std::vector<float>> list_header_center_points;
         std::vector<float> AD_wrist_position;
         string saved_output_video_path = "header_detection_video_output.mp4";
         detecting_header_byvideo(video_path, saved_output_video_path, write_fps,
             showClub, show_stack_input, debug_header,
             list_header_center_points, AD_wrist_position);
+        //Check leng list_header_center_points
+        cout << "Check leng list_header_center_points: " << list_header_center_points.size() << endl;
+        if (list_header_center_points.size() < 15)
+        {
+            cout << "Detect header failed" << endl;
+            return;
+        }
         // Finding phases
         std::vector<std::vector<float>> trimmed_header_center_points;
         int AD_frame, TOP_frame, IM_frame;
-        define_phases(list_header_center_points, trimmed_header_center_points,
-            AD_frame, TOP_frame, IM_frame);
+        try 
+        {
+            define_phases(list_header_center_points, trimmed_header_center_points,
+                AD_frame, TOP_frame, IM_frame);
+            //throw std::out_of_range("Out of range error!");
+        }
+        catch (...)
+        {
+            std::cerr << "Caught an unknown exception in define_phases!" << std::endl;
+            return;
+        }
+        cout << "AD_frame, TOP_frame, IM_frame: " << AD_frame << ", " << TOP_frame << ", " << IM_frame << endl;
         // Detect golfball
         std::vector<float> the_best_reference_point;
         cout << "************ Starting detect golfball *************" << endl;
@@ -971,11 +1026,13 @@ namespace st
             AD_wrist_position,
             IM_frame, debug_ball);
         std::vector<std::vector<float>> list_golfball_center_points;
+        cout << "the_best_reference_point: " << the_best_reference_point[0] << ", " << the_best_reference_point[1] << endl;
         detecting_golfball(video_path,
             list_golfball_center_points,
             the_first_golfball_point,
             the_best_reference_point,
             IM_frame, debug_ball);
+        cout << "list_golfball_center_points size: " << list_golfball_center_points.size() << endl;
         // Draw result
         draw_shot_trace(video_path,
             shot_trace_output_video_path,
@@ -983,6 +1040,312 @@ namespace st
             list_header_center_points,
             list_golfball_center_points,
             IM_frame, write_fps, 24);
+    }
+
+    //Update 2024/11/07
+    void draw_ball_trajectory(string video_path,
+        string trajectory_data_path,
+        int IM_frame, int write_fps, int interval)
+    {
+        std::vector<std::vector<float>> list_ball_center_points;
+        st::read_data(trajectory_data_path, list_ball_center_points);
+        
+        VideoCapture cap(video_path);
+        if (!cap.isOpened()) {
+            cerr << "Error opening video stream or file" << endl;
+            return;
+        }
+        int frame_height = static_cast<int>(cap.get(CAP_PROP_FRAME_HEIGHT));
+        int frame_width = static_cast<int>(cap.get(CAP_PROP_FRAME_WIDTH));
+
+        int fourcc = VideoWriter::fourcc('m', 'p', '4', 'v');
+        string save_file = std::filesystem::path(video_path).stem().string() + "_ball_trace.mp4";
+        string save_folder = "ball_trace_outputs";
+
+        if (!std::filesystem::exists(save_folder))
+        {
+            std::filesystem::create_directories(save_folder);
+        }
+        std::filesystem::path save_path = std::filesystem::path(save_folder) / save_file;
+        //cout << save_path.string();
+        VideoWriter writer(save_path.string(), fourcc, write_fps, Size(frame_width, frame_height), true);
+        
+        int length_2 = list_ball_center_points.size();
+        int number_lines_2 = 0;
+
+        int frame_num = 0;
+        Mat frame, previous_frame;
+        bool finish = false;
+
+        while (true) {
+            bool ret = cap.read(frame);
+            if (!ret || frame.empty()) {
+                cout << "Real video finished" << endl;
+                finish = true;
+            }
+            if (!finish) {
+                previous_frame = frame.clone();
+            }
+            else {
+                cout << "Extra video" << endl;
+                frame = previous_frame.clone();
+            }
+
+            // Visual ball trace
+            if (frame_num >= IM_frame && frame_num <= IM_frame + length_2 - 1) {
+                number_lines_2 = frame_num - IM_frame;
+            }
+            if (number_lines_2 > 0) {
+                for (int index = 0; index < number_lines_2; ++index) {
+                    Point point_1(list_ball_center_points[index][0], list_ball_center_points[index][1]);
+                    Point point_2(list_ball_center_points[index+1][0], list_ball_center_points[index+1][1]);
+                    line(frame, point_1, point_2, Scalar(0, 255, 0), 7, LINE_AA);
+                }
+            }
+
+            writer.write(frame);
+            imshow("frame", frame);
+            char k = waitKey(interval);
+            if (k == 27) {
+                break;
+            }
+            if (frame_num > IM_frame + length_2 && finish) {
+                break;
+            }
+            frame_num++;
+        }
+
+        save_file = std::filesystem::path(video_path).stem().string() + "_ball_trace.png";
+        save_path = std::filesystem::path(save_folder) / save_file;
+        imwrite(save_path.string(), frame);
+
+        destroyAllWindows();
+        cap.release();
+        writer.release();
+    }
+
+
+    std::vector<float> data_filter(const std::vector<float> data, int kernel_size, string mode = "median")
+    {
+        std::vector<float> filtered_data(data.size(), 0.0);
+        int padding = kernel_size / 2;
+
+        for (size_t i = padding; i < data.size() - padding; ++i) {
+            std::vector<float> window(data.begin() + i - padding, data.begin() + i + padding + 1);
+            if (mode == "median")
+            {
+                std::sort(window.begin(), window.end());
+                filtered_data[i] = window[window.size() / 2];
+            }
+            else
+                filtered_data[i] = std::accumulate(window.begin(), window.end(), 0.0) / window.size();
+        }
+        std::vector<float> res(filtered_data.begin() + padding, filtered_data.end() - padding);
+        return res;
+    }
+
+
+    template <typename T>
+    void print(T data)
+    {
+        std::cout << data << endl;
+    }
+
+
+    template <typename T>
+    void print(std::vector<T> data)
+    {
+        for (T value : data)
+        {
+            std::cout << value << " ";
+        }
+        std::cout << endl;
+    }
+
+
+    template <typename T>
+    void print(std::vector<std::vector<T>> data)
+    {
+        for (std::vector<T> value : data)
+        {
+            print(value);
+        }
+    }
+
+
+    bool define_address(const std::vector<std::vector<float>> list_header_center_points,
+        int& AD_frame, std::vector<int>& AD_coord)
+    {
+        int length = list_header_center_points.size();
+        if (length < 3)
+        {
+            cout << "Not enough data to define the Address" << endl;
+            return false;
+        }
+        // Split X và Y
+        std::vector<float> x_coords, y_coords;
+        for (const auto& point : list_header_center_points)
+        {
+            x_coords.push_back(point[0]);
+            y_coords.push_back(point[1]);
+        }
+        //cout << "y_coords" << endl;
+        //print(y_coords);
+        // np.argmax
+        auto max_index_iter = std::max_element(y_coords.begin(), y_coords.end());
+        size_t max_index = std::distance(y_coords.begin(), max_index_iter);
+        std::vector<float> survey_section_X(x_coords.begin(), x_coords.begin() + max_index);
+        std::vector<float> survey_section_Y(y_coords.begin(), y_coords.begin() + max_index);
+        float AD_Xcoord, AD_Ycoord;
+        if (length > 10)
+        {
+            std::vector<float> filtered_Xdata;
+            std::vector<float> filtered_Ydata;
+            if (length < 17)
+            {
+                int kernel_size = 3;
+                filtered_Xdata = data_filter(survey_section_X, kernel_size, "median");
+                filtered_Ydata = data_filter(survey_section_Y, kernel_size, "median");
+                AD_frame = length / 2;
+            }
+            else
+            {
+                int kernel_size = 5;
+                filtered_Ydata = data_filter(survey_section_Y, kernel_size, "median");
+                filtered_Ydata = data_filter(filtered_Ydata, kernel_size, "avg");
+                //cout << "filtered_Ydata" << endl;
+                //print(filtered_Ydata);
+                std::vector<float> inversed_data(filtered_Ydata.rbegin(), filtered_Ydata.rend());
+                std::vector<float> delta(inversed_data.size() - 1);
+                for (size_t i = 0; i < delta.size(); ++i)
+                {
+                    delta[i] = inversed_data[i] - inversed_data[i + 1];
+                    //cout << "delta: " << inversed_data[i] - inversed_data[i + 1] << endl;
+                }
+
+                // Find the last index for which delta > 1
+                auto it = std::find_if(delta.rbegin(), delta.rend(), [](float d) { return d > 1; });
+                int selected_index = std::distance(delta.begin(), it.base()) - 1;
+                AD_frame = filtered_Ydata.size() - selected_index;
+                filtered_Xdata = data_filter(survey_section_X, kernel_size, "median");
+                filtered_Xdata = data_filter(filtered_Xdata, kernel_size, "avg");
+            }
+            AD_Xcoord = filtered_Xdata[AD_frame];
+            AD_Ycoord = filtered_Ydata[AD_frame];
+        }
+        else
+        {
+            AD_frame = length / 2;
+            AD_Xcoord = st::np_median(survey_section_X);
+            AD_Ycoord = st::np_median(survey_section_Y);
+        }
+        AD_coord = { static_cast<int>(AD_Xcoord), static_cast<int>(AD_Ycoord) };
+        return true;
+    }
+
+
+    bool check_video(string video_path, int& FRAME_WIDTH, int& FRAME_HEIGHT)
+    {
+        cv::VideoCapture trycap(video_path);
+        if (!trycap.isOpened())
+        {
+            std::cout << "Failed to read video" << std::endl;
+            return false;
+        }
+
+        cv::Mat try_frame;
+        bool ret = trycap.read(try_frame);
+
+        if (!ret)
+        {
+            std::cout << "Failed to read video" << std::endl;
+            return false;
+        }
+        else
+        {
+            trycap.release();
+            FRAME_WIDTH = try_frame.cols;
+            FRAME_HEIGHT = try_frame.rows;
+            return true;
+        }
+    }
+
+
+    bool detecting_header_by_sequenceframes(string video_path,
+        std::vector<std::vector<float>>& list_header_center_points,
+        int start_frame, int end_frame, bool saveFrame=false)
+    {
+        string saved_output_frame = "./saved_header_detection_frames";
+        if (saveFrame)
+        {
+            utils::fs::remove_all(saved_output_frame);
+            utils::fs::createDirectory(saved_output_frame);
+        }
+        int back_frame = 5;
+        if (start_frame > end_frame)
+        {
+            std::cout << "end_frame must be greater than or equal to start_frame!" << std::endl;
+            return false;
+        }
+        if (start_frame < back_frame)
+        {
+            std::cout << "The smallest start_frame must be " << back_frame << std::endl;
+            return false;
+        }
+        int FRAME_WIDTH, FRAME_HEIGHT;
+        if (!check_video(video_path, FRAME_WIDTH, FRAME_HEIGHT))
+            return false;
+        
+        cv::VideoCapture cap(video_path);
+
+        int _startFrame = start_frame - back_frame;
+        cap.set(cv::CAP_PROP_POS_FRAMES, _startFrame);
+
+        int LENGTH = std::max(FRAME_WIDTH, FRAME_HEIGHT);
+        float SCALE_FACTOR = static_cast<float>(LENGTH) / DIM;
+        Ptr<BackgroundSubtractor> KNN_BACKSUB = createBackgroundSubtractorKNN(3, 500, true);
+        for (int frame_num = _startFrame; frame_num < start_frame; ++frame_num)
+        {
+            cv::Mat frame;
+            if (!cap.read(frame))
+            {
+                std::cout << "Failed to read frame at " << frame_num << std::endl;
+                return false;
+            }
+
+            cv::Mat mask_frame;
+            KNN_BACKSUB->apply(frame, mask_frame);
+        }
+
+        for (int frame_num = start_frame; frame_num < end_frame+1; ++frame_num)
+        {
+            cv::Mat frame;
+            if (!cap.read(frame))
+            {
+                std::cout << "Failed to read frame at " << frame_num << std::endl;
+                return false;
+            }
+
+            cv::Mat preprocessed_frame;
+            preprocessed_frame = preprocessing_frame(KNN_BACKSUB, LENGTH, FRAME_WIDTH, FRAME_HEIGHT, frame, true);
+            cv::Rect best_club_box(0, 0, 0, 0), best_header_box(0, 0, 0, 0);
+            float best_club_score = 0.;
+            float best_header_score = 0.;
+            std::vector<float> club_center_point, header_center_point;
+            detecting_header_byframe(preprocessed_frame,
+                best_club_box, best_header_box,
+                best_club_score, best_header_score,
+                club_center_point, header_center_point, SCALE_FACTOR);
+            list_header_center_points.push_back(header_center_point);
+            if (saveFrame)
+            {
+                string file = to_string(frame_num) + ".png";
+                string save_path = utils::fs::join(saved_output_frame, file);
+                cv::circle(frame, cv::Point(header_center_point[0], header_center_point[1]), 7, Scalar(0, 255, 0), -1);
+                imwrite(save_path, frame);
+            }
+        }
+        return true;
     }
 }
 
